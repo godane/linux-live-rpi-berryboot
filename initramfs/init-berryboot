@@ -1,0 +1,184 @@
+#!/bin/sh
+#
+# BerryBoot, ugly but functional image chooser thingy
+#
+# Author: Floris Bos
+#
+
+# Standard busybox init
+/bin/mount -t proc proc /proc
+/bin/mount -o remount,rw,noatime / 
+/bin/mount -t sysfs sysfs /sys
+/bin/mount -t devtmpfs dev /dev
+/bin/hostname -F /etc/hostname
+
+if grep -q debugconsole /proc/cmdline; then
+	/sbin/getty -L tty2 0 vt100 &
+fi
+
+# Sunxi
+if grep -q "mmc0_led" /proc/cmdline; then
+	if [ -e /sys/class/leds/ph20:green:led1 ]; then
+		echo mmc0 > /sys/class/leds/ph20:green:led1/trigger
+	fi
+fi
+
+# iMX.6
+if [ -e /sys/class/graphics/fb0/free_scale ]; then
+	sleep 2
+	echo -n 1080p > /sys/class/display/mode
+	echo 0 > /sys/class/ppmgr/ppscaler
+	echo 0 > /sys/class/graphics/fb0/free_scale
+	echo 1 > /sys/class/graphics/fb0/freescale_mode
+
+	M="0 0 1919 1079"
+	echo $M > /sys/class/graphics/fb0/free_scale_axis
+	echo $M > /sys/class/graphics/fb0/window_axis
+	echo 0x10001 > /sys/class/graphics/fb0/free_scale
+
+	echo 0 > /sys/class/graphics/fb0/blank
+fi
+
+if grep -q vncinstall /proc/cmdline; then
+	export QWS_DISPLAY="VNC:size=800x600:depth=32:0"
+	echo
+	echo Connect with your VNC client
+	echo If you wish to disable VNC mode: remove 'vncinstall' from cmdline.txt
+	echo
+fi
+
+# Pi touch screen
+if [ -e /sys/devices/platform/rpi_ft5406 ]; then
+	export QWS_MOUSE_PROTO="linuxinput:/dev/input/event0:grab=1 intellimouse:/dev/input/mice"
+fi
+
+# Show GUI, it will write the OS choosen to /tmp/answer
+/usr/bin/BerrybootGUI -qws 2>/tmp/debug
+killall udevd
+
+# Clear screen
+clear
+
+IMAGE=`cat /tmp/answer`
+DATADIR="/mnt/data/$IMAGE"
+SHAREDDIR="/mnt/shared"
+IMAGEPATH="/mnt/images/$IMAGE"
+rm /tmp/answer
+
+#
+# Set CPU governor to "ondemand" when booting an OS on the Pi
+# Set it to "performance" for other devices
+#
+if grep -q "BCM" /proc/cpuinfo; then
+	GOVERNOR=ondemand
+else
+	GOVERNOR=performance
+fi
+
+mkdir -p /squashfs /aufs $DATADIR
+clear
+# It's a bit tricky but is necessray to enable pivot_root
+# even for initramfs boot image
+#
+transfer_initramfs()
+{
+   if [ ! -r /lib/initramfs_escaped ]; then
+      echo "switch root from initramfs to ramfs"
+      SWITCH=/m # one letter directory
+      mkdir -p $SWITCH
+      mount -t tmpfs -o size="100%" tmpfs $SWITCH
+      cp -a /squashfs/??* $SWITCH 2>/dev/null # only copy two-and-more-letter directories
+      cd $SWITCH
+      echo "This file indicates that we successfully escaped initramfs" > $SWITCH/lib/initramfs_escaped
+      exec switch_root -c /dev/console . $0
+   fi
+}
+
+if [ "${IMAGE}" = "000-slax-setup.sb" ]; then
+		echo "slax setup"
+		echo Mounting image ${IMAGE}...
+		mount -o loop,ro ${IMAGEPATH} /squashfs
+		umount /proc /sys /dev
+		transfer_initramfs
+elif [ "$IMAGE" != "" ]; then
+
+	if [ -s ${DATADIR}/storage/.kodi/temp/oe_update/SYSTEM ]; then
+            echo "Updating OpenELEC"
+            mv -f ${DATADIR}/storage/.kodi/temp/oe_update/SYSTEM ${IMAGEPATH}
+            rm -rf ${DATADIR}/storage/.kodi/temp/oe_update/SYSTEM
+	fi
+
+	if [ -s ${DATADIR}/storage/.update/SYSTEM ]; then
+            echo "Updating OpenELEC"
+            mv -f ${DATADIR}/storage/.update/SYSTEM ${IMAGEPATH}
+            rm -rf ${DATADIR}/storage/.update/*
+	fi
+
+	echo Mounting image ${IMAGE}...
+	mount -o loop,ro ${IMAGEPATH} /squashfs
+	cd /squashfs
+
+	if [ -e berryboot-init ]; then
+		echo Executing init script
+		. ./berryboot-init
+	fi
+
+	#
+	# Fedora and Arch symlink /lib to /usr/lib and expect modules in /usr/lib/modules
+	# Symlinks do not work well with our shared folder structure
+	# so move folders around if necessary
+	#
+	if [ -L lib -o -L sbin ]; then
+		if [ -e ${SHAREDDIR}/lib/modules ]; then
+			mkdir -p ${SHAREDDIR}/usr
+			mv ${SHAREDDIR}/lib ${SHAREDDIR}/usr/lib
+			mv ${SHAREDDIR}/sbin ${SHAREDDIR}/usr/sbin 2>/dev/null
+                fi
+	else
+		if [ -e ${SHAREDDIR}/usr/lib/modules ]; then
+			mv ${SHAREDDIR}/usr/lib ${SHAREDDIR}/lib
+			mv ${SHAREDDIR}/usr/sbin ${SHAREDDIR}/sbin 2>/dev/null
+			rmdir ${SHAREDDIR}/usr
+		fi
+	fi
+
+	for initfile in sbin/init usr/lib/systemd/systemd lib/systemd/systemd init
+	do
+		if [ -e $initfile ]; then
+
+			if [ -e "root_on_tmpfs" ]; then
+				echo "Mounting RW data directory on top (with tmpfs, changes are discarded after reboot)"
+				# remouting SD-card read-only and adding tmpfs layer...
+				mount -o remount,ro /mnt
+				mkdir /tmpfs
+				mount -t tmpfs none /tmpfs
+				mount -t aufs -o br:/tmpfs:${SHAREDDIR}:/squashfs none /aufs
+			else
+				echo Mounting RW data directory on top
+				mount -t aufs -o br:${DATADIR}:${SHAREDDIR}:/squashfs none /aufs
+			fi
+
+			cd /aufs
+			mount -o move /dev dev
+			mount -o move /sys sys
+			mount -o move /proc proc
+			echo Setting CPU governor to $GOVERNOR
+			echo "$GOVERNOR" > sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+			echo Starting operating system ${IMAGE}...
+			exec switch_root . $initfile
+		fi
+	done
+
+	echo
+	echo Error: unable to locate or execute /sbin/init /usr/lib/systemd/systemd /init inside $IMAGE
+	echo
+	sleep 5
+fi
+
+# In case the user pressed cancel or something went wrong, show an emergency recovery shell
+clear
+echo
+echo Emergency recovery shell activated
+echo
+
+/bin/sh
