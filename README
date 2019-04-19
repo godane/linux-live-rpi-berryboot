@@ -1,0 +1,13 @@
+
+#extracting berryboot.img
+dd if=berryboot.img of=berryboot.lzo bs=64 skip=1
+lzop -d berryboot.lzo
+cpio -idmv < berryboot
+#add init-berryboot into this folder as init
+#in folder of the berryboot extract
+find . -print | cpio -o -H newc 2>/dev/null | xz -f --extreme --check=crc32 >berryboot.img
+mkimage -A arm -T ramdisk -C none -d berryboot.img berryboot.img1
+
+#to make 000-slax-setup.sb added init-slax as init
+#add config and livekitlib to lib folder
+#make squashfs named 000-slax-setup.sb
