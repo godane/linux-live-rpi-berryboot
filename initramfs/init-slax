@@ -1,0 +1,121 @@
+#!/bin/sh
+# Initial script for Linux Live Kit
+# Author: Tomas M <http://www.linux-live.org/>
+
+export PATH=.:/:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Standard busybox init
+#/bin/mount -t proc proc /proc
+#/bin/mount -o remount,rw,noatime / 
+#/bin/mount -t sysfs sysfs /sys
+#/bin/mount -t devtmpfs dev /dev
+
+. /lib/config
+. /lib/livekitlib
+
+transfer_initramfs
+
+MEMORY=/memory
+CHANGES=$MEMORY/changes
+UNION=$MEMORY/union
+DATAMNT=$MEMORY/data
+BUNDLES=$MEMORY/bundles
+
+header "Live Kit init <http://www.linux-live.org/>"
+
+init_proc_sysfs
+
+debug_start
+debug_shell
+# load some modules manually first, then modprobe everything we have
+init_devs
+init_aufs
+init_zram
+
+# modprobe all devices excluding network drivers
+modprobe_everything -v /drivers/net/
+
+# find data dir with filesystem bundles
+DATA="$(find_data 45 "$DATAMNT")"
+check_data_found "$DATA"
+debug_shell
+# setup persistent changes, if possible
+persistent_changes "$DATA" "$CHANGES"
+debug_shell
+# copy to RAM if needed
+DATA="$(copy_to_ram "$DATA" "$CHANGES")"
+debug_shell
+# init aufs union
+init_union "$CHANGES" "$UNION"
+debug_shell
+# add data to union
+union_append_bundles "$DATA" "$BUNDLES" "$UNION"
+debug_shell
+if [ ! -z "$hostname" ]; then
+# Configure hostname and network:
+#echo "${hostname}.example.net" > ${UNION}/etc/HOSTNAME
+echo "${hostname}" > ${UNION}/etc/hostname
+if [ -f ${UNION}/etc/NetworkManager/NetworkManager.conf ]; then
+  sed -i ${UNION}/etc/NetworkManager/NetworkManager.conf -e "s/^hostname=.*/hostname=${hostname}/"
+fi
+echo "127.0.0.1 localhost" > ${UNION}/etc/hosts
+echo "::1 localhost ip6-localhost ip6-loopback" >> ${UNION}/etc/hosts
+echo "ff02::1 ip6-allnodes" >> ${UNION}/etc/hosts
+echo "ff02::2 ipt-allrouters" >> ${UNION}/etc/hosts
+echo "127.0.0.1 ${hostname}.example.net ${hostname}" >> ${UNION}/etc/hosts
+fi
+
+#setup user and password
+if [ ! -z "$user" ]; then
+	if [ ! -d $UNION/home/$user ]; then
+		[ -d $UNION/home ] || mkdir -p $UNION/home
+		echo "Setting up $user"
+		#chroot $UNION /usr/sbin/useradd -m -g users -s /bin/bash $user
+		#chroot $UNION /usr/sbin/usermod -G wheel,audio,cdrom,floppy,plugdev,video,power,netdev,lp,scanner,kmem $user
+		chroot $UNION useradd -m -g users -s /bin/bash $user
+		chroot $UNION useradd -m -g users -s /bin/bash $user
+		chroot $UNION usermod -G audio,cdrom,floppy,plugdev,video,netdev,lp,scanner,kmem,sudo $user
+		debug_shell
+		echo "Setting up $user password"
+		echo "$user:$user" > $UNION/tmp/chpasswd.tmp
+		#chroot $UNION /usr/sbin/chpasswd < $UNION/tmp/chpasswd.tmp
+		chroot $UNION chpasswd < $UNION/tmp/chpasswd.tmp
+		debug_shell
+		
+		rm -f $UNION/tmp/chpasswd.tmp
+		# Configure suauth:
+		#echo "Configure suauth"
+		#echo "root:${user}:OWNPASS" > ${UNION}/etc/suauth
+		#echo "root:ALL EXCEPT GROUP users:DENY" >> ${UNION}/etc/suauth
+		#chmod 600 ${UNION}/etc/suauth
+
+		# Configure sudoers:
+		#echo "Configure sudoers"
+		#chmod 640 ${UNION}/etc/sudoers
+		#sed -i ${UNION}/etc/sudoers -e 's/# *\(%users\sALL=(ALL)\sALL\)/\1/'
+		#chmod 440 ${UNION}/etc/sudoers
+
+	else
+		echo "/home/$user folder exists."
+	fi
+fi
+debug_shell
+#timezone
+if [ ! -z "$timezone" ]; then
+	if [ -f $UNION/usr/share/zoneinfo/$timezone ]; then
+		echo "Timezone $timezone"
+		ln -sf /usr/share/zoneinfo/$timezone $UNION/etc/localtime
+	fi
+fi
+debug_shell
+# rootcopy
+copy_rootcopy_content "$DATA" "$UNION"
+debug_shell
+# create fstab
+fstab_create "$UNION" "$DATAMNT"
+debug_shell
+header "Live Kit done, starting $LIVEKITNAME"
+change_root "$UNION"
+
+header "!!ERROR occured, you shouldn't be here.!!"
+/bin/sh
